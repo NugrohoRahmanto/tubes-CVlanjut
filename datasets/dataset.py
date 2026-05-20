@@ -6,10 +6,6 @@ import math
 
 import cv2
 import numpy as np
-try:
-    import jpeg4py as jpeg
-except Exception:
-    jpeg = None
 from PIL import Image
 import torch
 from torch.utils import data
@@ -148,20 +144,12 @@ class DocSAM_GT(data.Dataset):
         - mask: torch.Tensor, mask tensor.
         """
 
-        img_path = os.path.join(self.data_paths[data_idx], "image", self.image_names[data_idx][index])
-        img_path_resize = os.path.join(self.data_paths[data_idx], "image_resize", self.image_names[data_idx][index])
-        if os.path.exists(img_path_resize):
-            img_path = img_path_resize
+        img_path = self._get_model_image_path(data_idx, index)
 
         if not os.path.isfile(img_path):
             raise FileNotFoundError(f"Image file not found: {img_path}")
 
-        if img_path.endswith(".jpg") and jpeg is not None:
-            try:
-                image = jpeg.JPEG(img_path).decode()[:,:,::-1].copy()
-            except:
-                image = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        elif img_path.endswith(".gif") or img_path.endswith(".tif"):
+        if img_path.endswith(".gif") or img_path.endswith(".tif"):
             image = Image.open(img_path).convert("RGB")
             image = np.array(image)[:,:,::-1].copy()
         else:
@@ -174,6 +162,21 @@ class DocSAM_GT(data.Dataset):
         mask  = torch.ones((1, image.size(1),  image.size(2))).float()
         
         return image, mask
+
+
+    def _get_model_image_path(self, data_idx, index):
+        img_path = os.path.join(self.data_paths[data_idx], "image", self.image_names[data_idx][index])
+        img_path_resize = os.path.join(self.data_paths[data_idx], "image_resize", self.image_names[data_idx][index])
+        if os.path.exists(img_path_resize):
+            return img_path_resize
+        return img_path
+
+
+    def _get_original_image_path(self, data_idx, index):
+        img_path = os.path.join(self.data_paths[data_idx], "image", self.image_names[data_idx][index])
+        if os.path.exists(img_path):
+            return img_path
+        return self._get_model_image_path(data_idx, index)
 
 
     def _coco_data_rectify(self, coco_data):
@@ -548,6 +551,7 @@ class DocSAM_GT(data.Dataset):
                         'class_names': class_names, 
                         'dataset_names': self.dataset_names[data_idx], 
                         'image_names': os.path.splitext(self.image_names[data_idx][index])[0],
+                        'image_paths': self._get_original_image_path(data_idx, index),
                         'image_bboxes': torch.tensor([0, 0, image.size(2), image.size(1)]).long()
                     }
                     samples.append(sample)
@@ -577,6 +581,7 @@ class DocSAM_GT(data.Dataset):
                     'class_names': class_names,
                     'dataset_names': self.dataset_names[data_idx],
                     'image_names': os.path.splitext(self.image_names[data_idx][index])[0],
+                    'image_paths': self._get_original_image_path(data_idx, index),
                     'image_bboxes': torch.tensor([0, 0, image.size(2), image.size(1)]).long()
                 }
                 samples.append(sample)
@@ -619,6 +624,7 @@ class DocSAM_GT(data.Dataset):
                     'class_names': class_names,
                     'dataset_names': self.dataset_names[data_idx],
                     'image_names': os.path.splitext(self.image_names[data_idx][index])[0],
+                    'image_paths': self._get_original_image_path(data_idx, index),
                     'image_bboxes': torch.tensor([0, 0, image.size(2), image.size(1)]).long()
                 }
                 samples.append(sample)
@@ -648,7 +654,7 @@ class DocSAM_GT(data.Dataset):
         # Initialize a dictionary to collect all elements from the batch
         batch_dict = {
             'pixel_values': [], 'pixel_mask': [], 'instance_masks': [], 'instance_bboxes': [], 'instance_labels': [], 'semantic_masks': [],
-            'coco_datas': [], 'class_names': [], 'dataset_names': [], 'image_names': [], 'image_bboxes': []
+            'coco_datas': [], 'class_names': [], 'dataset_names': [], 'image_names': [], 'image_paths': [], 'image_bboxes': []
         }
 
         # Iterate through each sample in the batch and populate the batch dictionary
@@ -664,6 +670,7 @@ class DocSAM_GT(data.Dataset):
                 batch_dict['class_names'].append(sample['class_names'])
                 batch_dict['dataset_names'].append(sample['dataset_names'])
                 batch_dict['image_names'].append(sample['image_names'])
+                batch_dict['image_paths'].append(sample['image_paths'])
                 batch_dict['image_bboxes'].append(sample['image_bboxes'])
 
         # Padding images and masks to the largest dimensions in the batch (only for training stage)

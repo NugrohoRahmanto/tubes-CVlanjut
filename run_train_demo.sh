@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eu
 
 cd "$(dirname "$0")"
 uname -a
@@ -71,27 +71,12 @@ SNAPSHOT_DIR=./snapshots/
 START_ITER=0
 TOTAL_ITER=4000
 GPU_IDS=${GPU_IDS:-0}
-NPROC_PER_NODE=${NPROC_PER_NODE:-$(awk -F, '{print NF}' <<< "${GPU_IDS}")}
+NPROC_PER_NODE=${NPROC_PER_NODE:-$(printf '%s\n' "${GPU_IDS}" | awk -F, '{print NF}')}
 
-TRAIN_PATHS=(
-    "${TRAIN_PATH_1}"
-    "${TRAIN_PATH_2}"
-    "${TRAIN_PATH_3}"
-    "${TRAIN_PATH_4}"
-    "${TRAIN_PATH_5}"
-    "${TRAIN_PATH_6}"
-)
+TRAIN_PATHS="${TRAIN_PATH_1} ${TRAIN_PATH_2} ${TRAIN_PATH_3} ${TRAIN_PATH_4} ${TRAIN_PATH_5} ${TRAIN_PATH_6}"
+EVAL_PATHS="${EVAL_PATH_1} ${EVAL_PATH_2} ${EVAL_PATH_3} ${EVAL_PATH_4} ${EVAL_PATH_5} ${EVAL_PATH_6}"
 
-EVAL_PATHS=(
-    "${EVAL_PATH_1}"
-    "${EVAL_PATH_2}"
-    "${EVAL_PATH_3}"
-    "${EVAL_PATH_4}"
-    "${EVAL_PATH_5}"
-    "${EVAL_PATH_6}"
-)
-
-for path in "${TRAIN_PATHS[@]}" "${EVAL_PATHS[@]}"; do
+for path in ${TRAIN_PATHS} ${EVAL_PATHS}; do
     [ -d "${path}" ] || { echo "Missing dataset folder: ${path}" >&2; exit 1; }
 done
 [ -f "${RESTORE_FROM}" ] || { echo "Missing checkpoint: ${RESTORE_FROM}" >&2; exit 1; }
@@ -99,8 +84,8 @@ mkdir -p "${SAVE_PATH}" "${SNAPSHOT_DIR}" logs outputs temp
 
 export OMP_NUM_THREADS=1
 CUDA_VISIBLE_DEVICES=${GPU_IDS} "${TORCHRUN:-torchrun}" --rdzv_backend=c10d --rdzv_endpoint=localhost:0 --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" train.py \
-    --train-path "${TRAIN_PATHS[@]}" \
-    --eval-path "${EVAL_PATHS[@]}" \
+    --train-path ${TRAIN_PATHS} \
+    --eval-path ${EVAL_PATHS} \
     --model-size ${MODEL_SIZE} --save-path ${SAVE_PATH} --max-num ${MAX_NUM} \
     --short-range ${SHORT_RANGE} --patch-size ${PATCH_SIZE} --patch-num ${PATCH_NUM} --keep-size ${KEEP_SIZE} \
     --batch-size ${BATCH_SIZE} --learning-rate ${LEARNING_RATE} --momentum ${MOMENTUM} --weight-decay ${WEIGHT_DECAY} --lr-scheduler ${LR_SCHEDULER} \

@@ -13,7 +13,7 @@ np.set_printoptions(linewidth=400)
 np.set_printoptions(precision=4)
 
 import cv2
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
@@ -124,6 +124,9 @@ def get_arguments():
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help='Batch size for processing')
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM, help='Path to restore model from')
     parser.add_argument("--gpus", type=str, default=GPU_IDS, help='Comma-separated GPU IDs')
+    parser.add_argument("--visual-score-threshold", type=float, default=0.5, help='Minimum score shown in visualization')
+    parser.add_argument("--visual-mask-alpha", type=float, default=0.32, help='Mask overlay opacity for visualization')
+    parser.add_argument("--visual-use-original", type=str2bool, default=True, help='Use original image resolution for saved visualizations')
 
     return parser.parse_args()
 
@@ -171,6 +174,8 @@ def validate_runtime_args(args):
     args.gpus = ",".join([gpu.strip() for gpu in args.gpus.split(",") if gpu.strip()])
     if not args.gpus:
         raise ValueError("--gpus must contain at least one GPU id, for example --gpus 0")
+    args.visual_score_threshold = max(0.0, min(1.0, args.visual_score_threshold))
+    args.visual_mask_alpha = max(0.0, min(1.0, args.visual_mask_alpha))
     return args
 
 
@@ -254,6 +259,154 @@ def bimask_to_id_mask(bimasks):
         instance_mask[bimask == True] = i + 1
 
     return instance_mask
+
+
+def tensor_to_rgb_image(pixel_values):
+    image = pixel_values.permute(1, 2, 0).detach().cpu().numpy()
+    image = np.clip(image, 0, 255).astype(np.uint8)[:, :, ::-1]
+    return np.ascontiguousarray(image)
+
+
+def load_visual_base_image(args, batch, index, pixel_values):
+    model_image = tensor_to_rgb_image(pixel_values)
+    if getattr(args, "visual_use_original", True):
+        image_path = None
+        if "image_paths" in batch and len(batch["image_paths"]) > index:
+            image_path = batch["image_paths"][index]
+        if image_path and os.path.isfile(image_path):
+            try:
+                with PILImage.open(image_path) as image_file:
+                    image = ImageOps.exif_transpose(image_file).convert("RGB")
+                    image = np.ascontiguousarray(np.array(image))
+                scale_x = image.shape[1] / max(model_image.shape[1], 1)
+                scale_y = image.shape[0] / max(model_image.shape[0], 1)
+                return image, scale_x, scale_y
+            except Exception as exc:
+                print(f"Warning: failed to load original image for visualization: {image_path} ({exc})")
+    return model_image, 1.0, 1.0
+
+
+def save_rgb_png(image, path):
+    MakePath(path)
+    PILImage.fromarray(np.ascontiguousarray(image)).save(path, compress_level=1)
+
+
+def save_rgb_jpeg(image, path):
+    MakePath(path)
+    PILImage.fromarray(np.ascontiguousarray(image)).save(path, quality=95, subsampling=0)
+
+
+def overlay_id_mask(image, id_mask, palette, alpha=0.32):
+    output = image.copy()
+    mask = id_mask > 0
+    if not np.any(mask):
+        return output
+    color_mask = id_map_to_color(id_mask, palette)
+    blended = output.astype(np.float32)
+    blended[mask] = blended[mask] * (1.0 - alpha) + color_mask[mask].astype(np.float32) * alpha
+    output[mask] = np.clip(blended[mask], 0, 255).astype(np.uint8)
+    return output
+
+
+def resize_binary_masks(masks, target_shape):
+    target_h, target_w = target_shape
+    if torch.is_tensor(masks):
+        masks = masks.detach().cpu().numpy()
+    masks = np.asarray(masks)
+    if masks.ndim == 2:
+        masks = masks[None]
+    if masks.shape[0] == 0:
+        return np.zeros((0, target_h, target_w), dtype=bool)
+    if masks.shape[-2:] == (target_h, target_w):
+        return masks.astype(bool)
+
+    resized = np.zeros((masks.shape[0], target_h, target_w), dtype=bool)
+    for idx, mask in enumerate(masks):
+        resized[idx] = cv2.resize(
+            mask.astype(np.uint8),
+            (target_w, target_h),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    return resized
+
+
+def build_category_id_mask(instance_masks, labels, scores, target_shape, score_threshold):
+    masks = resize_binary_masks(instance_masks, target_shape)
+    if torch.is_tensor(labels):
+        labels = labels.detach().cpu().numpy()
+    if torch.is_tensor(scores):
+        scores = scores.detach().cpu().numpy()
+
+    category_mask = np.zeros(target_shape, dtype=np.int32)
+    for idx in range(masks.shape[0]):
+        if float(scores[idx]) >= score_threshold:
+            category_mask[masks[idx]] = int(labels[idx])
+    return category_mask
+
+
+def palette_color(palette, category_id):
+    start = int(category_id) * 3
+    if start + 3 <= len(palette):
+        return tuple(int(item) for item in palette[start:start + 3])
+    return (255, 64, 64)
+
+
+def scale_bbox_xyxy(bbox, scale_x, scale_y):
+    x1, y1, x2, y2 = [float(item) for item in bbox]
+    return [x1 * scale_x, y1 * scale_y, x2 * scale_x, y2 * scale_y]
+
+
+def scale_bbox_xywh(bbox, scale_x, scale_y):
+    x, y, w, h = [float(item) for item in bbox]
+    return [x * scale_x, y * scale_y, w * scale_x, h * scale_y]
+
+
+def xywh_to_xyxy(bbox):
+    x, y, w, h = [float(item) for item in bbox]
+    return [x, y, x + w, y + h]
+
+
+def draw_labeled_box(image, bbox_xyxy, label, color, score=None):
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    x1 = int(round(max(0, min(x1, w - 1))))
+    y1 = int(round(max(0, min(y1, h - 1))))
+    x2 = int(round(max(0, min(x2, w - 1))))
+    y2 = int(round(max(0, min(y2, h - 1))))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    thickness = max(2, int(round(min(h, w) / 320)))
+    font_scale = max(0.45, min(1.1, min(h, w) / 900))
+    text_thickness = max(1, thickness - 1)
+    text = str(label) if score is None else f"{label} {score:.2f}"
+
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 0), thickness + 2)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+
+    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_thickness)
+    pad = max(4, thickness + 2)
+    box_w = min(w - x1, text_w + pad * 2)
+    if box_w <= 0:
+        return
+
+    if y1 - text_h - baseline - pad * 2 >= 0:
+        box_y1 = y1 - text_h - baseline - pad * 2
+        box_y2 = y1
+        text_y = y1 - baseline - pad
+    else:
+        box_y1 = y1
+        box_y2 = min(h, y1 + text_h + baseline + pad * 2)
+        text_y = min(h - baseline - 1, box_y1 + text_h + pad)
+
+    box_x1 = x1
+    box_x2 = min(w, x1 + box_w)
+    overlay = image.copy()
+    cv2.rectangle(overlay, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.72, image, 0.28, 0, image)
+    cv2.rectangle(image, (box_x1, box_y1), (box_x2, box_y2), color, max(1, thickness // 2))
+    cv2.putText(image, text, (box_x1 + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), text_thickness + 2, cv2.LINE_AA)
+    cv2.putText(image, text, (box_x1 + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA)
 
 
 def mask_bbox(masks, img_shape=None, is_norm=False):
@@ -1076,66 +1229,52 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
 
                 # Save visualizations for the first `save_num` images
                 if img_num < save_num:
-                    # Save the original image
-                    image = pixel_values.permute(1, 2, 0).cpu().numpy().astype(np.uint8)[:, :, ::-1]
-                    image = np.ascontiguousarray(image)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
-                    PILImage.fromarray(image).save(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
+                    image, scale_x, scale_y = load_visual_base_image(args, batch, i, pixel_values)
+                    visual_shape = image.shape[:2]
+                    save_rgb_jpeg(image, os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
+                    save_rgb_png(image, os.path.join(args.save_path, dataset_names, image_names + ".png"))
 
                     # Visualize and save semantic ground truth masks
-                    image_semantic_gt = copy.deepcopy(image)
-                    semantic_gt = bimask_to_id_mask(semantic_masks.cpu().numpy())
-                    color_mask = id_map_to_color(semantic_gt, semantic_palette)
-                    image_semantic_gt[semantic_gt > 0] = image_semantic_gt[semantic_gt > 0] // 2 + color_mask[semantic_gt > 0] // 2
-                    image_semantic_gt = PILImage.fromarray(image_semantic_gt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
-                    image_semantic_gt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
+                    semantic_gt = bimask_to_id_mask(resize_binary_masks(semantic_masks, visual_shape))
+                    image_semantic_gt = overlay_id_mask(image, semantic_gt, semantic_palette, args.visual_mask_alpha)
+                    save_rgb_png(image_semantic_gt, os.path.join(args.save_path, dataset_names, image_names + "_semantic_gt.png"))
 
                     # Visualize and save predicted semantic masks
-                    image_semantic_dt = copy.deepcopy(image)
-                    semantic_dt = bimask_to_id_mask(results['semantic_maskes'].cpu().numpy())
-                    color_mask = id_map_to_color(semantic_dt, semantic_palette)
-                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[semantic_dt > 0] // 2
-                    image_semantic_dt = PILImage.fromarray(image_semantic_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
-                    image_semantic_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
+                    semantic_dt = bimask_to_id_mask(resize_binary_masks(results['semantic_maskes'], visual_shape))
+                    image_semantic_dt = overlay_id_mask(image, semantic_dt, semantic_palette, args.visual_mask_alpha)
+                    save_rgb_png(image_semantic_dt, os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
 
                     # Visualize and save instance ground truth masks
-                    image_instance_gt = copy.deepcopy(image)
-                    instance_gt = bimask_to_id_mask(instance_masks.cpu().numpy())
-                    color_mask = id_map_to_color(instance_gt, instance_palette)
-                    image_instance_gt[instance_gt > 0] = image_instance_gt[instance_gt > 0] // 2 + color_mask[instance_gt > 0] // 2
+                    instance_gt = bimask_to_id_mask(resize_binary_masks(instance_masks, visual_shape))
+                    image_instance_gt = overlay_id_mask(image, instance_gt, instance_palette, args.visual_mask_alpha)
 
-                    image_instance_dt = copy.deepcopy(image)
-                    instance_dt = bimask_to_id_mask(results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
-                    color_mask = id_map_to_color(instance_dt, instance_palette)
-                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[instance_dt > 0] // 2
+                    selected_masks = results['instance_maskes'][results['instance_scores'] >= args.visual_score_threshold]
+                    instance_dt = bimask_to_id_mask(resize_binary_masks(selected_masks, visual_shape))
+                    image_instance_dt = overlay_id_mask(image, instance_dt, instance_palette, args.visual_mask_alpha)
 
                     # Draw bounding boxes and labels on the instance ground truth image
                     for bbox, label in zip(instance_bboxes, batch['instance_labels'][i]):
-                        x1, y1, x2, y2 = bbox
-                        category_id = label + 1
-                        cv2.rectangle(image_instance_gt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
-                        class_score = class_names[category_id - 1]
-                        cv2.putText(image_instance_gt, class_score, (int(x1), int(y1)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id * 3:category_id * 3 + 3], 1)
+                        category_id = int(label.item()) + 1
+                        bbox_xyxy = scale_bbox_xyxy(bbox.detach().cpu().numpy().tolist(), scale_x, scale_y)
+                        draw_labeled_box(
+                            image_instance_gt,
+                            bbox_xyxy,
+                            class_names[category_id - 1],
+                            palette_color(semantic_palette, category_id),
+                        )
 
-                    image_instance_gt = PILImage.fromarray(image_instance_gt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
-                    image_instance_gt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
+                    save_rgb_png(image_instance_gt, os.path.join(args.save_path, dataset_names, image_names + "_instance_gt.png"))
 
                     # Visualize and save predicted category masks
-                    image_category_dt = copy.deepcopy(image)
-
-                    category_dt = torch.zeros(results['instance_maskes'].shape[-2:]).long()
-                    for j in range(results['instance_maskes'].size(0)):
-                        if results['instance_scores'][j] >= 0.5:
-                            category_dt[results['instance_maskes'][j] == 1] = results['instance_labels'][j]
-
-                    color_mask = id_map_to_color(category_dt, semantic_palette)
-                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[category_dt > 0] // 2
-                    image_category_dt = PILImage.fromarray(image_category_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
-                    image_category_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
+                    category_dt = build_category_id_mask(
+                        results['instance_maskes'],
+                        results['instance_labels'],
+                        results['instance_scores'],
+                        visual_shape,
+                        args.visual_score_threshold,
+                    )
+                    image_category_dt = overlay_id_mask(image, category_dt, semantic_palette, args.visual_mask_alpha)
+                    save_rgb_png(image_category_dt, os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
 
                 # Update semantic segmentation metrics
                 for c in range(semantic_masks.size(0)):
@@ -1174,16 +1313,18 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                         "score": score,
                     })
                     
-                    if img_num < save_num and score >= 0.5:
-                        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[0]+bbox[2], bbox[1]+bbox[3]
-                        cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id*3:category_id*3+3], thickness=2)
-                        class_score = class_names[category_id-1] + "-" + str(round(score, 4))
-                        cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id*3:category_id*3+3], 1)
+                    if img_num < save_num and score >= args.visual_score_threshold:
+                        bbox_xyxy = xywh_to_xyxy(scale_bbox_xywh(bbox, scale_x, scale_y))
+                        draw_labeled_box(
+                            image_instance_dt,
+                            bbox_xyxy,
+                            class_names[category_id - 1],
+                            palette_color(semantic_palette, category_id),
+                            score,
+                        )
 
                 if img_num < save_num:
-                    image_instance_dt = PILImage.fromarray(image_instance_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
-                    image_instance_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
+                    save_rgb_png(image_instance_dt, os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
                 
                 img_num += 1  # Increment the image counter
 
@@ -1512,6 +1653,8 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                 class_names = batch['class_names'][i]
 
                 results = batch_results[i]  # Prediction results for the current image
+                image, scale_x, scale_y = load_visual_base_image(args, batch, i, pixel_values)
+                visual_shape = image.shape[:2]
 
                 dt = []  # List to store detection results
                 # Process and append detection results
@@ -1522,10 +1665,11 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                     score = results['instance_scores'][j].item()
 
                     # Use mask_utils.encode() to transform mask into RLE format
-                    binary_mask = results['instance_maskes'][j].cpu().numpy().astype(np.uint8)
+                    binary_mask = resize_binary_masks(results['instance_maskes'][j:j + 1], visual_shape)[0].astype(np.uint8)
                     segmentation = mask_utils.encode(np.asfortranarray(binary_mask))
                     segmentation['counts'] = segmentation['counts'].decode('utf-8')  # Decode RLE counts
                     bbox = results['instance_bboxes'][j].cpu().numpy().tolist()  # Extract bounding box coordinates
+                    bbox = scale_bbox_xywh(bbox, scale_x, scale_y)
 
                     dt.append({
                         "image_id": image_id,
@@ -1547,55 +1691,46 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
 
                 # Save visualizations for the first `save_num` images
                 if img_num < save_num:
-                    # Save the original image
-                    image = pixel_values.permute(1, 2, 0).cpu().numpy().astype(np.uint8)[:, :, ::-1]  # Convert to HWC and BGR format
-                    image = np.ascontiguousarray(image)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
-                    PILImage.fromarray(image).save(os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
+                    save_rgb_jpeg(image, os.path.join(args.save_path, dataset_names, image_names + ".jpg"))
+                    save_rgb_png(image, os.path.join(args.save_path, dataset_names, image_names + ".png"))
 
                     # Visualize and save predicted semantic masks
-                    image_semantic_dt = copy.deepcopy(image)
-                    semantic_dt = bimask_to_id_mask(results['semantic_maskes'].cpu().numpy())  # Convert binary mask to ID mask
-                    color_mask = id_map_to_color(semantic_dt, semantic_palette)  # Apply color palette
-                    image_semantic_dt[semantic_dt > 0] = image_semantic_dt[semantic_dt > 0] // 2 + color_mask[semantic_dt > 0] // 2
-                    image_semantic_dt = PILImage.fromarray(image_semantic_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
-                    image_semantic_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
+                    semantic_dt = bimask_to_id_mask(resize_binary_masks(results['semantic_maskes'], visual_shape))  # Convert binary mask to ID mask
+                    image_semantic_dt = overlay_id_mask(image, semantic_dt, semantic_palette, args.visual_mask_alpha)
+                    save_rgb_png(image_semantic_dt, os.path.join(args.save_path, dataset_names, image_names + "_semantic_dt.png"))
 
                     # Visualize and save instance ground truth masks
-                    image_instance_dt = copy.deepcopy(image)
-                    instance_dt = bimask_to_id_mask(results['instance_maskes'][results['instance_scores'] > 0.5].cpu().numpy())
-                    color_mask = id_map_to_color(instance_dt, instance_palette)
-                    image_instance_dt[instance_dt > 0] = image_instance_dt[instance_dt > 0] // 2 + color_mask[instance_dt > 0] // 2
+                    selected_masks = results['instance_maskes'][results['instance_scores'] >= args.visual_score_threshold]
+                    instance_dt = bimask_to_id_mask(resize_binary_masks(selected_masks, visual_shape))
+                    image_instance_dt = overlay_id_mask(image, instance_dt, instance_palette, args.visual_mask_alpha)
 
                     # Draw bounding boxes and class labels for high-confidence predictions
                     for j in range(results['instance_maskes'].size(0)):
                         category_id = results['instance_labels'][j].item()
                         score = results['instance_scores'][j].item()
                         bbox = results['instance_bboxes'][j].cpu().numpy().tolist()
-                        if score >= 0.5:
-                            x1, y1, x2, y2 = bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]
-                            cv2.rectangle(image_instance_dt, (int(x1), int(y1)), (int(x2), int(y2)), color=semantic_palette[category_id * 3:category_id * 3 + 3], thickness=2)
-                            class_score = class_names[category_id - 1] + "-" + str(round(score, 4))
-                            cv2.putText(image_instance_dt, class_score, (int(x1), int(y2)), cv2.FONT_HERSHEY_SIMPLEX, 0.3, semantic_palette[category_id * 3:category_id * 3 + 3], 1)
+                        if score >= args.visual_score_threshold:
+                            bbox_xyxy = xywh_to_xyxy(scale_bbox_xywh(bbox, scale_x, scale_y))
+                            draw_labeled_box(
+                                image_instance_dt,
+                                bbox_xyxy,
+                                class_names[category_id - 1],
+                                palette_color(semantic_palette, category_id),
+                                score,
+                            )
 
-                    image_instance_dt = PILImage.fromarray(image_instance_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
-                    image_instance_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
+                    save_rgb_png(image_instance_dt, os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
 
                     # Visualize and save predicted category masks
-                    image_category_dt = copy.deepcopy(image)
-
-                    category_dt = torch.zeros(results['instance_maskes'].shape[-2:]).long()
-                    for j in range(results['instance_maskes'].size(0)):
-                        if results['instance_scores'][j] >= 0.5:
-                            category_dt[results['instance_maskes'][j] == 1] = results['instance_labels'][j]
-
-                    color_mask = id_map_to_color(category_dt, semantic_palette)
-                    image_category_dt[category_dt > 0] = image_category_dt[category_dt > 0] // 2 + color_mask[category_dt > 0] // 2
-                    image_category_dt = PILImage.fromarray(image_category_dt)
-                    MakePath(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
-                    image_category_dt.save(os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
+                    category_dt = build_category_id_mask(
+                        results['instance_maskes'],
+                        results['instance_labels'],
+                        results['instance_scores'],
+                        visual_shape,
+                        args.visual_score_threshold,
+                    )
+                    image_category_dt = overlay_id_mask(image, category_dt, semantic_palette, args.visual_mask_alpha)
+                    save_rgb_png(image_category_dt, os.path.join(args.save_path, dataset_names, image_names + "_category_dt.png"))
 
                 img_num += 1  # Increment the image counter
 
