@@ -1,0 +1,35 @@
+[project]
+name = "docsam"
+version = "0.1.0"
+description = "DocSAM document image segmentation project"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "accelerate==1.1.1",
+    "einops==0.8.1",
+    "huggingface-hub==0.26.3",
+    "jpeg4py==0.1.4",
+    "numpy==2.2.4",
+    "opencv-python==4.10.0.84",
+    "pillow==11.1.0",
+    "prefetch-generator==1.0.3",
+    "pycocotools==2.0.8",
+    "requests==2.32.3",
+    "scipy==1.15.2",
+    "torch==2.5.1",
+    "torch-dct==0.1.6",
+    "torchvision==0.20.1",
+    "tqdm==4.67.1",
+    "transformers==4.49.0",
+]
+
+[project.optional-dependencies]
+# Only needed for TPU/XLA workflows. It is not imported by train.py, test.py,
+# datasets/, or the local DocSAM model code, so it is kept out of the default
+# environment to avoid forcing XLA wheels on normal CUDA/CPU setups.
+xla = [
+    "torch-xla==2.6.0",
+]
+
+[tool.uv]
+package = false

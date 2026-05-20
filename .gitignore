@@ -1,0 +1,48 @@
+# Python/uv runtime
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local generated data and large artifacts.
+# Keep the directory layout in git via .gitkeep files, but do not commit payloads.
+data/**
+!data/**/
+!data/**/.gitkeep
+logs/**
+!logs/**/
+!logs/**/.gitkeep
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+pretrained_model/**
+!pretrained_model/**/
+!pretrained_model/**/.gitkeep
+snapshots/**
+!snapshots/**/
+!snapshots/**/.gitkeep
+temp/**
+!temp/**/
+!temp/**/.gitkeep
+
+# Common large model/data files, regardless of location.
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.h5
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.npy
+*.npz
+
+# Logs and run outputs
+*.log
+nohup.out
