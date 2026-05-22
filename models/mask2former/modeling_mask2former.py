@@ -1753,9 +1753,12 @@ class Mask2FormerPixelDecoder(nn.Module):
 
         encoder_output = torch.split(last_hidden_state, [size.item() for size in split_sizes], dim=1)
 
-        # Compute final features
+        # Rebuild dense feature maps before later convolutions; MPS rejects the
+        # strided transpose/view layout produced by the encoder split here.
         outputs = [
-            x.transpose(1, 2).view(batch_size, -1, spatial_shapes[i][0], spatial_shapes[i][1])
+            x.transpose(1, 2)
+            .reshape(batch_size, -1, spatial_shapes[i][0], spatial_shapes[i][1])
+            .contiguous()
             for i, x in enumerate(encoder_output)
         ]
         
