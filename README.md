@@ -135,6 +135,19 @@ Pretrained weights of [Mask2Former](https://huggingface.co/facebook/mask2former-
 ## Running Inference
 bash scripts/run_streamlit_app.sh
 
+### Apple Silicon Local Inference
+The Streamlit app and `test.py` automatically use Apple Silicon MPS when CUDA is
+not available and PyTorch reports MPS as available.
+
+```bash
+uv sync
+uv run python -c "import torch; print(torch.backends.mps.is_available())"
+PYTORCH_ENABLE_MPS_FALLBACK=1 bash scripts/run_streamlit_app.sh
+```
+
+MPS support is intended for local inference. Training still uses CUDA distributed
+APIs in `train.py`.
+
 ## Running Demo
 DATASET=PubLayNet bash run_inference_demo_hd_clean.sh
 DATASET=Style1 bash run_inference_demo_hd_clean.sh

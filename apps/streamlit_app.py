@@ -572,6 +572,14 @@ def clear_inference_result():
     st.session_state.pop("inference_result", None)
 
 
+def accelerator_status() -> tuple[bool, str]:
+    if torch.cuda.is_available():
+        return True, "CUDA ready"
+    if torch.backends.mps.is_available():
+        return True, "Apple MPS ready"
+    return False, "GPU unavailable"
+
+
 def show_inference_result(result: dict):
     result_files = result["files"]
     rows = result["rows"]
@@ -640,7 +648,7 @@ def main():
     patch_size = "640,640"
     keep_size = False
 
-    cuda_label = "CUDA ready" if torch.cuda.is_available() else "CUDA unavailable"
+    accelerator_ready, accelerator_label = accelerator_status()
     checkpoint_label = "model ready" if checkpoint_path.is_file() else "model missing"
     st.markdown(
         f"""
@@ -650,7 +658,7 @@ def main():
             <div class="app-subtitle">Upload dokumen, pilih model, atur threshold, lalu lihat hasil segmentasi lokal.</div>
           </div>
           <div class="status-cluster">
-            <div class="status-pill">{cuda_label}</div>
+            <div class="status-pill">{accelerator_label}</div>
             <div class="status-pill">{checkpoint_label}</div>
           </div>
         </div>
@@ -668,11 +676,11 @@ def main():
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    can_run = uploaded_file is not None and checkpoint_path.is_file() and torch.cuda.is_available()
+    can_run = uploaded_file is not None and checkpoint_path.is_file() and accelerator_ready
     if uploaded_file is not None and not checkpoint_path.is_file():
         st.error(f"Checkpoint tidak ditemukan: {checkpoint_path}")
-    if uploaded_file is not None and not torch.cuda.is_available():
-        st.error("CUDA tidak tersedia. Pipeline DocSAM ini membutuhkan GPU CUDA.")
+    if uploaded_file is not None and not accelerator_ready:
+        st.error("GPU tidak tersedia. Gunakan GPU CUDA atau Apple Silicon MPS.")
 
     st.markdown('<div class="control-shell">', unsafe_allow_html=True)
     control_left, control_mid, control_right = st.columns([1.1, 1.4, 1])
@@ -716,7 +724,8 @@ def main():
             st.error(f"Config tidak valid: {exc}")
             return
 
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        if torch.cuda.is_available():
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
 
         with st.spinner("Loading model dan menjalankan inference..."):
             try:

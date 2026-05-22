@@ -154,6 +154,27 @@ def normalize_paths(paths):
     return [os.path.normpath(path) for path in (paths or []) if path]
 
 
+def get_accelerator_device(gpu_id=0):
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{gpu_id}")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    raise RuntimeError("No supported GPU backend is available. Use CUDA or Apple Silicon MPS.")
+
+
+def clear_device_cache(device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+
+
+def move_batch_item(item, device):
+    if isinstance(item, list):
+        return [value.to(device) for value in item]
+    return item.to(device)
+
+
 def validate_runtime_args(args):
     args.eval_path = normalize_paths(args.eval_path)
     if not args.eval_path:
@@ -168,8 +189,7 @@ def validate_runtime_args(args):
 
     os.makedirs(args.save_path, exist_ok=True)
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. DocSAM test/inference currently requires a CUDA GPU.")
+    get_accelerator_device()
 
     if args.gpus == "None":
         args.gpus = "0"
@@ -1179,11 +1199,12 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
     - all_tp_nums (list of lists): True positive counts for each category at different IoU thresholds.
     """
 
-    # Set the device to the specified GPU and move the model to the GPU
-    torch.cuda.set_device(gpu_id)
-    model = model.cuda(gpu_id)
+    # Set the requested accelerator and move the model onto it.
+    device = get_accelerator_device(gpu_id)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    model = model.to(device)
     model.eval()  # Set the model to evaluation mode
-    device = next(model.parameters()).device  # Get the device where the model resides
 
     # Extract categories from the first batch in the dataloader
     for batch in dataloader:
@@ -1216,15 +1237,15 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
     img_num = 0  # Counter for processed images
     with torch.no_grad():  # Disable gradient computation for evaluation
         for batch in tqdm(dataloader):
-            torch.cuda.empty_cache()  # Clear GPU memory cache
+            clear_device_cache(device)
 
-            # Move batch data to the specified GPU
-            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
-            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'], list) else batch['pixel_mask'].cuda(device)
-            batch['instance_masks'] = [item.cuda(device) for item in batch['instance_masks']]
-            batch['instance_bboxes'] = [item.cuda(device) for item in batch['instance_bboxes']]
-            batch['instance_labels'] = [item.cuda(device) for item in batch['instance_labels']]
-            batch['semantic_masks'] = [item.cuda(device) for item in batch['semantic_masks']]
+            # Move batch data to the selected accelerator.
+            batch['pixel_values'] = move_batch_item(batch['pixel_values'], device)
+            batch['pixel_mask'] = move_batch_item(batch['pixel_mask'], device)
+            batch['instance_masks'] = move_batch_item(batch['instance_masks'], device)
+            batch['instance_bboxes'] = move_batch_item(batch['instance_bboxes'], device)
+            batch['instance_labels'] = move_batch_item(batch['instance_labels'], device)
+            batch['semantic_masks'] = move_batch_item(batch['semantic_masks'], device)
 
             # Perform predictions using either whole-image or sliding window approach
             if stage == "train":
@@ -1363,7 +1384,7 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
 
     # Restore the model to training mode and clear GPU memory cache
     model.train()
-    torch.cuda.empty_cache()
+    clear_device_cache(device)
 
     # Return evaluation results
     return (coco_gt, coco_dt, semantic_true_nums, semantic_pred_nums, semantic_correct_nums, all_true_nums, all_pred_nums, all_tp_nums)
@@ -1653,20 +1674,21 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
     - None: This function performs inference and saves results but does not return any value.
     """
 
-    # Set the device to the specified GPU and move the model to the GPU
-    torch.cuda.set_device(gpu_id)
-    model = model.cuda(gpu_id)
+    # Set the requested accelerator and move the model onto it.
+    device = get_accelerator_device(gpu_id)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    model = model.to(device)
     model.eval()  # Set the model to evaluation mode (disables dropout, etc.)
-    device = next(model.parameters()).device  # Get the device where the model resides
 
     img_num = 0  # Counter for processed images
     with torch.no_grad():  # Disable gradient computation for evaluation
         for batch in tqdm(dataloader):  # Iterate over batches from the dataloader
-            torch.cuda.empty_cache()  # Clear GPU memory cache to free up space
+            clear_device_cache(device)
 
-            # Move batch data to the specified GPU
-            batch['pixel_values'] = [item.cuda(device) for item in batch['pixel_values']] if isinstance(batch['pixel_values'], list) else batch['pixel_values'].cuda(device)
-            batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'], list) else batch['pixel_mask'].cuda(device)
+            # Move batch data to the selected accelerator.
+            batch['pixel_values'] = move_batch_item(batch['pixel_values'], device)
+            batch['pixel_mask'] = move_batch_item(batch['pixel_mask'], device)
 
             # Perform inference using a sliding window approach
             batch_results = predict_slide_window(
@@ -1782,7 +1804,7 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
 
     # Restore the model to training mode and clear GPU memory cache
     model.train()
-    torch.cuda.empty_cache()
+    clear_device_cache(device)
     
     
 def inference_parallel(args, model, dataset, save_num=50, stage="inference", thres_num=None):
@@ -1931,7 +1953,7 @@ if __name__ == '__main__':
     
     args = validate_runtime_args(get_arguments())
 
-    if args.gpus != 'None':
+    if args.gpus != 'None' and torch.cuda.is_available():
         os.environ["CUDA_VISIBLE_DEVICES"]=args.gpus
     
     # Instantiate the DocSAM model
