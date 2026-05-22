@@ -127,6 +127,8 @@ def get_arguments():
     parser.add_argument("--visual-score-threshold", type=float, default=0.5, help='Minimum score shown in visualization')
     parser.add_argument("--visual-mask-alpha", type=float, default=0.32, help='Mask overlay opacity for visualization')
     parser.add_argument("--visual-use-original", type=str2bool, default=True, help='Use original image resolution for saved visualizations')
+    parser.add_argument("--visual-bbox-only", type=str2bool, default=False, help='Save predicted bounding boxes without label text')
+    parser.add_argument("--predict-batch-size", type=int, default=16, help='Initial sliding-window patch batch size for inference')
 
     return parser.parse_args()
 
@@ -176,6 +178,7 @@ def validate_runtime_args(args):
         raise ValueError("--gpus must contain at least one GPU id, for example --gpus 0")
     args.visual_score_threshold = max(0.0, min(1.0, args.visual_score_threshold))
     args.visual_mask_alpha = max(0.0, min(1.0, args.visual_mask_alpha))
+    args.predict_batch_size = max(1, args.predict_batch_size)
     return args
 
 
@@ -407,6 +410,21 @@ def draw_labeled_box(image, bbox_xyxy, label, color, score=None):
     cv2.rectangle(image, (box_x1, box_y1), (box_x2, box_y2), color, max(1, thickness // 2))
     cv2.putText(image, text, (box_x1 + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), text_thickness + 2, cv2.LINE_AA)
     cv2.putText(image, text, (box_x1 + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), text_thickness, cv2.LINE_AA)
+
+
+def draw_box(image, bbox_xyxy, color):
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy
+    x1 = int(round(max(0, min(x1, w - 1))))
+    y1 = int(round(max(0, min(y1, h - 1))))
+    x2 = int(round(max(0, min(x2, w - 1))))
+    y2 = int(round(max(0, min(y2, h - 1))))
+    if x2 <= x1 or y2 <= y1:
+        return
+
+    thickness = max(2, int(round(min(h, w) / 320)))
+    cv2.rectangle(image, (x1, y1), (x2, y2), (0, 0, 0), thickness + 2)
+    cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
 
 
 def mask_bbox(masks, img_shape=None, is_norm=False):
@@ -1007,7 +1025,7 @@ def predict_with_dynamic_batch_size(model, pixel_values, pixel_mask, image_bboxe
             batch_size = math.ceil(batch_size / 2)  # Halve the batch size and retry
 
 
-def predict_slide_window(model, batch, patch_size, layer_idx=-1):
+def predict_slide_window(model, batch, patch_size, patch_batch_size=16, layer_idx=-1):
     """
     Performs prediction using a sliding window technique.
 
@@ -1053,7 +1071,15 @@ def predict_slide_window(model, batch, patch_size, layer_idx=-1):
     
     # Perform predictions using dynamic batch size to handle memory constraints
     all_instance_masks, all_bbox_predictions, all_cate_predictions, all_semantic_masks = \
-        predict_with_dynamic_batch_size(model, all_pixel_values, all_pixel_mask, all_image_bboxes, all_class_names, batch_size=16, layer_idx=layer_idx)
+        predict_with_dynamic_batch_size(
+            model,
+            all_pixel_values,
+            all_pixel_mask,
+            all_image_bboxes,
+            all_class_names,
+            batch_size=patch_batch_size,
+            layer_idx=layer_idx,
+        )
     
     # Split predictions back into per-image results based on the number of patches per image
     all_instance_masks   = all_instance_masks.split(image_patch_nums, dim=0)
@@ -1204,7 +1230,12 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
             if stage == "train":
                 batch_results = predict_whole(model, batch)
             else:
-                batch_results = predict_slide_window(model, batch, patch_size=args.patch_size)
+                batch_results = predict_slide_window(
+                    model,
+                    batch,
+                    patch_size=args.patch_size,
+                    patch_batch_size=getattr(args, "predict_batch_size", 16),
+                )
 
             # Process results for each image in the batch
             for i in range(len(batch_results)):
@@ -1251,6 +1282,8 @@ def evaluate(args, model, dataloader, gpu_id=0, save_num=50, stage="test"):
                     selected_masks = results['instance_maskes'][results['instance_scores'] >= args.visual_score_threshold]
                     instance_dt = bimask_to_id_mask(resize_binary_masks(selected_masks, visual_shape))
                     image_instance_dt = overlay_id_mask(image, instance_dt, instance_palette, args.visual_mask_alpha)
+                    if getattr(args, "visual_bbox_only", False):
+                        save_rgb_png(image_instance_dt, os.path.join(args.save_path, dataset_names, image_names + "_segmented_dt.png"))
 
                     # Draw bounding boxes and labels on the instance ground truth image
                     for bbox, label in zip(instance_bboxes, batch['instance_labels'][i]):
@@ -1636,7 +1669,12 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
             batch['pixel_mask'] = [item.cuda(device) for item in batch['pixel_mask']] if isinstance(batch['pixel_mask'], list) else batch['pixel_mask'].cuda(device)
 
             # Perform inference using a sliding window approach
-            batch_results = predict_slide_window(model, batch, patch_size=args.patch_size)
+            batch_results = predict_slide_window(
+                model,
+                batch,
+                patch_size=args.patch_size,
+                patch_batch_size=getattr(args, "predict_batch_size", 16),
+            )
 
             # Process results for each image in the batch
             for i in range(len(batch_results)):
@@ -1703,6 +1741,9 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                     selected_masks = results['instance_maskes'][results['instance_scores'] >= args.visual_score_threshold]
                     instance_dt = bimask_to_id_mask(resize_binary_masks(selected_masks, visual_shape))
                     image_instance_dt = overlay_id_mask(image, instance_dt, instance_palette, args.visual_mask_alpha)
+                    image_bbox_dt = image.copy() if getattr(args, "visual_bbox_only", False) else None
+                    if getattr(args, "visual_bbox_only", False):
+                        save_rgb_png(image_instance_dt, os.path.join(args.save_path, dataset_names, image_names + "_segmented_dt.png"))
 
                     # Draw bounding boxes and class labels for high-confidence predictions
                     for j in range(results['instance_maskes'].size(0)):
@@ -1711,15 +1752,20 @@ def inference(args, model, dataloader, gpu_id=0, save_num=50, stage="inference")
                         bbox = results['instance_bboxes'][j].cpu().numpy().tolist()
                         if score >= args.visual_score_threshold:
                             bbox_xyxy = xywh_to_xyxy(scale_bbox_xywh(bbox, scale_x, scale_y))
+                            color = palette_color(semantic_palette, category_id)
+                            if image_bbox_dt is not None:
+                                draw_box(image_bbox_dt, bbox_xyxy, color)
                             draw_labeled_box(
                                 image_instance_dt,
                                 bbox_xyxy,
                                 class_names[category_id - 1],
-                                palette_color(semantic_palette, category_id),
+                                color,
                                 score,
                             )
 
                     save_rgb_png(image_instance_dt, os.path.join(args.save_path, dataset_names, image_names + "_instance_dt.png"))
+                    if image_bbox_dt is not None:
+                        save_rgb_png(image_bbox_dt, os.path.join(args.save_path, dataset_names, image_names + "_bbox_dt.png"))
 
                     # Visualize and save predicted category masks
                     category_dt = build_category_id_mask(

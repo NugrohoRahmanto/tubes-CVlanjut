@@ -4,9 +4,12 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from math import ceil, floor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +37,10 @@ DEFAULT_CLASSES = ["text", "table", "list", "title", "figure", "_background_"]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "pretrained_model" / "docsam_large_all_dataset.pth"
 RUNTIME_ROOT = PROJECT_ROOT / "data" / "streamlit_runtime"
 OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "streamlit"
+OCR_SEGMENT_TYPES = {"list", "table", "text", "title"}
+LOCAL_TESSERACT_CMD = PROJECT_ROOT / "tools" / "tesseract" / "tesseract.AppImage"
+TESSERACT_LANG = os.environ.get("TESSERACT_LANG", "eng")
+TESSERACT_PSM = os.environ.get("TESSERACT_PSM", "6")
 
 
 st.set_page_config(
@@ -46,9 +53,30 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+      :root {
+        --docsam-black: #111111;
+        --docsam-charcoal: #2a2a2a;
+        --docsam-red: #d71920;
+        --docsam-red-dark: #ad1118;
+        --docsam-red-soft: #fff1f1;
+        --docsam-line: #d7d7d7;
+        --docsam-muted: #5a5a5a;
+        --docsam-surface: #f6f6f6;
+      }
+      html,
+      body,
+      [data-testid="stAppViewContainer"],
+      .stApp {
+        background: #ffffff;
+        color: var(--docsam-black);
+      }
+      [data-testid="stHeader"],
+      [data-testid="stToolbar"] {
+        background: #ffffff;
+      }
       .block-container {
-        max-width: 1180px;
-        padding-top: 2rem;
+        max-width: 1320px;
+        padding-top: 1.4rem;
         padding-bottom: 3rem;
       }
       [data-testid="stSidebar"] {
@@ -56,62 +84,163 @@ st.markdown(
       }
       .app-header {
         display: flex;
-        align-items: flex-end;
+        align-items: center;
         justify-content: space-between;
         gap: 1rem;
-        margin-bottom: 1.25rem;
+        border-top: 5px solid var(--docsam-red);
+        border-bottom: 1px solid var(--docsam-black);
+        margin-bottom: 1.2rem;
+        padding: 1rem 0 1.15rem;
       }
       .app-title {
-        font-size: 2.25rem;
+        color: var(--docsam-black);
+        font-size: 2.85rem;
         line-height: 1.05;
-        font-weight: 750;
+        font-weight: 800;
         letter-spacing: 0;
         margin: 0;
       }
       .app-subtitle {
-        color: #667085;
+        color: var(--docsam-muted);
         font-size: 1rem;
-        margin-top: .45rem;
+        margin-top: .55rem;
+      }
+      .status-cluster {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: .55rem;
       }
       .status-pill {
-        border: 1px solid #d0d5dd;
-        border-radius: 999px;
-        padding: .45rem .8rem;
-        color: #344054;
-        background: #fff;
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid var(--docsam-black);
+        border-radius: 8px;
+        color: var(--docsam-black);
+        display: inline-flex;
+        gap: .45rem;
+        padding: .48rem .72rem;
         white-space: nowrap;
-        font-size: .9rem;
+        font-size: .88rem;
+        font-weight: 650;
+      }
+      .status-pill::before {
+        background: var(--docsam-red);
+        border-radius: 999px;
+        content: "";
+        height: .58rem;
+        width: .58rem;
       }
       .upload-shell {
-        border: 1px solid #e4e7ec;
+        background: linear-gradient(90deg, var(--docsam-red) 0 92px, var(--docsam-black) 92px 100%) top / 100% 3px no-repeat,
+          var(--docsam-surface);
+        border: 1px solid var(--docsam-black);
         border-radius: 8px;
-        padding: 1rem 1rem .35rem;
-        background: #fcfcfd;
+        padding: 1rem 1rem .45rem;
         margin-bottom: 1rem;
       }
       div[data-testid="stFileUploader"] section {
-        border: 1px dashed #98a2b3;
+        border: 1px dashed var(--docsam-charcoal);
         background: #ffffff;
         border-radius: 8px;
         min-height: 170px;
       }
+      div[data-testid="stFileUploader"] section:hover {
+        border-color: var(--docsam-red);
+        background: var(--docsam-red-soft);
+      }
+      div[data-testid="stFileUploader"] button,
+      div[data-testid="stDownloadButton"] button {
+        background: #ffffff;
+        border: 1px solid var(--docsam-black);
+        color: var(--docsam-black);
+      }
+      div[data-testid="stFileUploader"] button:hover,
+      div[data-testid="stDownloadButton"] button:hover {
+        border-color: var(--docsam-red);
+        color: var(--docsam-red-dark);
+      }
       .control-shell {
-        border-top: 1px solid #eaecf0;
-        padding-top: 1rem;
-        margin-top: .5rem;
+        background: #ffffff;
+        border-bottom: 1px solid var(--docsam-line);
+        border-top: 1px solid var(--docsam-line);
+        margin-top: .6rem;
+        padding: 1rem 0 .8rem;
+      }
+      div[data-testid="stButton"] > button[kind="primary"] {
+        background: var(--docsam-red);
+        border: 1px solid var(--docsam-red);
+        color: #ffffff;
+        min-height: 2.75rem;
+        font-weight: 700;
+      }
+      div[data-testid="stButton"] > button[kind="primary"]:hover {
+        background: var(--docsam-red-dark);
+        border-color: var(--docsam-red-dark);
+        color: #ffffff;
+      }
+      div[data-testid="stButton"] > button[kind="primary"]:disabled {
+        background: #efefef;
+        border-color: #c7c7c7;
+        color: #777777;
+      }
+      div[data-testid="stSegmentedControl"] button {
+        border-radius: 6px;
+        font-weight: 650;
+      }
+      div[data-testid="stSlider"] [role="slider"] {
+        box-shadow: 0 0 0 2px #ffffff, 0 0 0 3px var(--docsam-black);
       }
       .result-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        margin: 1.25rem 0 .5rem;
+        border-left: 4px solid var(--docsam-red);
+        color: var(--docsam-black);
+        font-size: 1rem;
+        font-weight: 800;
+        margin: 1.35rem 0 .65rem;
+        padding-left: .65rem;
+        text-transform: uppercase;
+      }
+      [data-testid="stImage"] img {
+        border: 1px solid var(--docsam-black);
+        border-radius: 8px;
+        background: #ffffff;
+      }
+      button[data-baseweb="tab"] {
+        color: var(--docsam-charcoal);
+        font-weight: 650;
+      }
+      button[data-baseweb="tab"][aria-selected="true"] {
+        color: var(--docsam-black);
+      }
+      [data-baseweb="tab-highlight"] {
+        background-color: var(--docsam-red);
+      }
+      [data-testid="stExpander"] details {
+        background: var(--docsam-surface);
+        border: 1px solid var(--docsam-line);
+        border-radius: 8px;
+      }
+      [data-testid="stExpander"] summary {
+        color: var(--docsam-black);
+        font-weight: 650;
+      }
+      [data-testid="stAlert"] {
+        border-radius: 8px;
       }
       @media (max-width: 720px) {
         .app-header {
           display: block;
+          padding-top: .9rem;
+        }
+        .app-title {
+          font-size: 2.1rem;
+        }
+        .status-cluster {
+          justify-content: flex-start;
+          margin-top: .9rem;
         }
         .status-pill {
-          display: inline-block;
-          margin-top: .8rem;
+          font-size: .84rem;
         }
       }
     </style>
@@ -177,6 +306,7 @@ def build_args(
         keep_size=keep_size,
         max_num=1,
         batch_size=1,
+        predict_batch_size=2,
         restore_from=str(checkpoint_path),
         gpus=gpu_ids,
         visual_score_threshold=score_threshold,
@@ -227,7 +357,7 @@ def find_result_files(save_path: Path, image_stem: str) -> dict[str, Path | None
     }
 
 
-def read_jsonl(path: Path | None, limit: int = 100) -> list[dict]:
+def read_jsonl(path: Path | None, limit: int | None = None) -> list[dict]:
     if path is None or not path.is_file():
         return []
     rows = []
@@ -237,9 +367,187 @@ def read_jsonl(path: Path | None, limit: int = 100) -> list[dict]:
             if not line:
                 continue
             rows.append(json.loads(line))
-            if len(rows) >= limit:
+            if limit is not None and len(rows) >= limit:
                 break
     return rows
+
+
+def compact_bbox(raw_bbox) -> dict[str, float] | None:
+    if not isinstance(raw_bbox, list) or len(raw_bbox) != 4:
+        return None
+    try:
+        x, y, width, height = [round(float(item), 2) for item in raw_bbox]
+    except (TypeError, ValueError):
+        return None
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def normalize_ocr_text(raw_text: str) -> str:
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw_text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def resolve_tesseract_cmd() -> str | None:
+    override = os.environ.get("TESSERACT_CMD")
+    if override:
+        return override
+    if LOCAL_TESSERACT_CMD.is_file():
+        return str(LOCAL_TESSERACT_CMD)
+    return shutil.which("tesseract")
+
+
+def crop_bbox(image: Image.Image, bbox: dict[str, float]) -> Image.Image | None:
+    left = max(0, floor(bbox["x"]))
+    top = max(0, floor(bbox["y"]))
+    right = min(image.width, ceil(bbox["x"] + bbox["width"]))
+    bottom = min(image.height, ceil(bbox["y"] + bbox["height"]))
+    if left >= right or top >= bottom:
+        return None
+    return image.crop((left, top, right, bottom))
+
+
+def run_tesseract_ocr(image: Image.Image, tesseract_cmd: str, lang: str) -> str:
+    with tempfile.TemporaryDirectory(prefix="docsam_ocr_") as temp_dir:
+        crop_path = Path(temp_dir) / "segment.png"
+        image.save(crop_path)
+        result = subprocess.run(
+            [
+                tesseract_cmd,
+                str(crop_path),
+                "stdout",
+                "--oem",
+                "1",
+                "--psm",
+                TESSERACT_PSM,
+                "-l",
+                lang,
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=30,
+        )
+    return normalize_ocr_text(result.stdout)
+
+
+def build_chunking_json(
+    rows: list[dict],
+    document_name: str,
+    score_threshold: float,
+    image: Image.Image | None = None,
+    tesseract_cmd: str | None = None,
+    ocr_lang: str = TESSERACT_LANG,
+) -> dict:
+    segments = []
+    ocr_errors = []
+    for row in rows:
+        category = str(row.get("category_id", "unknown"))
+        bbox = compact_bbox(row.get("bbox"))
+        try:
+            raw_score = float(row.get("score", 0.0))
+        except (TypeError, ValueError):
+            raw_score = 0.0
+        if category == "_background_" or bbox is None or raw_score < score_threshold:
+            continue
+        text = ""
+        if image is not None and tesseract_cmd and not ocr_errors and category in OCR_SEGMENT_TYPES:
+            crop = crop_bbox(image, bbox)
+            if crop is not None:
+                try:
+                    text = run_tesseract_ocr(crop, tesseract_cmd, ocr_lang)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    ocr_errors.append(str(exc))
+        segments.append(
+            {
+                "type": category,
+                "score": round(raw_score, 4),
+                "bbox": bbox,
+                "text": text,
+            }
+        )
+
+    segments.sort(key=lambda item: (item["bbox"]["y"], item["bbox"]["x"]))
+    for index, segment in enumerate(segments, start=1):
+        segment["segment_id"] = f"segment_{index:03d}"
+
+    chunk_groups = []
+    active_title = None
+    active_segments = []
+    for segment in segments:
+        if segment["type"] == "title":
+            if active_segments:
+                chunk_groups.append((active_title, active_segments))
+            active_title = segment
+            active_segments = [segment]
+            continue
+        active_segments.append(segment)
+
+    if active_segments:
+        chunk_groups.append((active_title, active_segments))
+
+    chunks = []
+    for index, (title_segment, chunk_segments) in enumerate(chunk_groups, start=1):
+        chunk_text = "\n\n".join(segment["text"] for segment in chunk_segments if segment["text"])
+        chunks.append(
+            {
+                "chunk_id": f"chunk_{index:03d}",
+                "title_segment_id": title_segment["segment_id"] if title_segment else None,
+                "title_text": title_segment["text"] if title_segment else "",
+                "segment_count": len(chunk_segments),
+                "text": chunk_text,
+                "segments": chunk_segments,
+            }
+        )
+
+    if image is None:
+        ocr_status = "skipped"
+        ocr_message = "Gambar sumber OCR tidak tersedia."
+    elif not tesseract_cmd:
+        ocr_status = "unavailable"
+        ocr_message = "Executable tesseract tidak ditemukan di PATH atau TESSERACT_CMD."
+    elif ocr_errors:
+        ocr_status = "error"
+        ocr_message = ocr_errors[0]
+    else:
+        ocr_status = "ok"
+        ocr_message = ""
+
+    return {
+        "document_name": document_name,
+        "strategy": "detected_title_segments",
+        "score_threshold": round(score_threshold, 2),
+        "segment_count": len(segments),
+        "title_segment_count": sum(segment["type"] == "title" for segment in segments),
+        "ocr": {
+            "engine": "tesseract",
+            "language": ocr_lang,
+            "status": ocr_status,
+            "message": ocr_message,
+        },
+        "chunks": chunks,
+    }
+
+
+def save_chunking_jsonl(jsonl_path: Path | None, image_stem: str, payload: dict) -> Path | None:
+    if jsonl_path is None:
+        return None
+    chunk_path = jsonl_path.with_name(f"{image_stem}_chunks.jsonl")
+    lines = []
+    for chunk in payload["chunks"]:
+        lines.append(
+            json.dumps(
+                {
+                    "document_name": payload["document_name"],
+                    "strategy": payload["strategy"],
+                    "score_threshold": payload["score_threshold"],
+                    "ocr": payload["ocr"],
+                    **chunk,
+                },
+                ensure_ascii=False,
+            )
+        )
+    chunk_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return chunk_path
 
 
 def show_image(path: Path | None, caption: str):
@@ -247,6 +555,81 @@ def show_image(path: Path | None, caption: str):
         st.image(str(path), caption=caption, use_container_width=True)
     else:
         st.info(f"{caption} belum tersedia.")
+
+
+@st.fragment
+def show_download_button(label: str, path: Path, mime: str, key: str):
+    st.download_button(
+        label,
+        data=path.read_bytes(),
+        file_name=path.name,
+        mime=mime,
+        key=key,
+    )
+
+
+def clear_inference_result():
+    st.session_state.pop("inference_result", None)
+
+
+def show_inference_result(result: dict):
+    result_files = result["files"]
+    rows = result["rows"]
+    chunking_json = result["chunking_json"]
+    chunking_path = result["chunking_path"]
+
+    st.success(f"Inference selesai. Output disimpan di {result['save_path']}")
+    st.markdown('<div class="result-title">Result</div>', unsafe_allow_html=True)
+    tab_instance, tab_category, tab_semantic, tab_chunks, tab_json = st.tabs(
+        ["Instance", "Category", "Semantic", "Chunking JSONL", "Detection JSONL"]
+    )
+    with tab_instance:
+        show_image(result_files["instance"], "Instance mask + bbox")
+    with tab_category:
+        show_image(result_files["category"], "Category mask")
+    with tab_semantic:
+        show_image(result_files["semantic"], "Semantic mask")
+    with tab_chunks:
+        if chunking_json["ocr"]["status"] != "ok":
+            st.warning(chunking_json["ocr"]["message"])
+        st.json(chunking_json, expanded=2)
+        if chunking_path and chunking_path.is_file():
+            show_download_button(
+                "Download Chunking JSONL",
+                chunking_path,
+                "application/jsonl",
+                key=f"download-chunking-{chunking_path}",
+            )
+    with tab_json:
+        if rows:
+            compact_rows = [
+                {
+                    "category": row.get("category_id"),
+                    "score": round(float(row.get("score", 0.0)), 4),
+                    "bbox": [round(float(x), 2) for x in row.get("bbox", [])],
+                }
+                for row in rows[:100]
+            ]
+            st.dataframe(compact_rows, use_container_width=True)
+            jsonl_path = result_files["jsonl"]
+            if jsonl_path and jsonl_path.is_file():
+                show_download_button(
+                    "Download JSONL",
+                    jsonl_path,
+                    "application/jsonl",
+                    key=f"download-detections-{jsonl_path}",
+                )
+        else:
+            st.info("JSONL belum tersedia.")
+
+    instance_path = result_files["instance"]
+    if instance_path and instance_path.is_file():
+        show_download_button(
+            "Download Result PNG",
+            instance_path,
+            "image/png",
+            key=f"download-result-{instance_path}",
+        )
 
 
 def main():
@@ -266,7 +649,10 @@ def main():
             <h1 class="app-title">DocSAM Inference</h1>
             <div class="app-subtitle">Upload dokumen, pilih model, atur threshold, lalu lihat hasil segmentasi lokal.</div>
           </div>
-          <div class="status-pill">{cuda_label} · {checkpoint_label}</div>
+          <div class="status-cluster">
+            <div class="status-pill">{cuda_label}</div>
+            <div class="status-pill">{checkpoint_label}</div>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -277,6 +663,8 @@ def main():
         "Drop atau pilih gambar dokumen",
         type=["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
         label_visibility="visible",
+        key="document_upload",
+        on_change=clear_inference_result,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -339,46 +727,27 @@ def main():
                 return
 
         result_files = find_result_files(save_path, image_stem)
-        st.success(f"Inference selesai. Output disimpan di {save_path}")
-
-        st.markdown('<div class="result-title">Result</div>', unsafe_allow_html=True)
-        tab_instance, tab_category, tab_semantic, tab_json = st.tabs(
-            ["Instance", "Category", "Semantic", "JSONL"]
+        rows = read_jsonl(result_files["jsonl"])
+        tesseract_cmd = resolve_tesseract_cmd()
+        chunking_json = build_chunking_json(
+            rows,
+            uploaded_file.name,
+            score_threshold,
+            image=preview,
+            tesseract_cmd=tesseract_cmd,
         )
-        with tab_instance:
-            show_image(result_files["instance"], "Instance mask + bbox")
-        with tab_category:
-            show_image(result_files["category"], "Category mask")
-        with tab_semantic:
-            show_image(result_files["semantic"], "Semantic mask")
-        with tab_json:
-            rows = read_jsonl(result_files["jsonl"])
-            if rows:
-                compact_rows = [
-                    {
-                        "category": row.get("category_id"),
-                        "score": round(float(row.get("score", 0.0)), 4),
-                        "bbox": [round(float(x), 2) for x in row.get("bbox", [])],
-                    }
-                    for row in rows
-                ]
-                st.dataframe(compact_rows, use_container_width=True)
-                st.download_button(
-                    "Download JSONL",
-                    data=result_files["jsonl"].read_bytes(),
-                    file_name=result_files["jsonl"].name,
-                    mime="application/jsonl",
-                )
-            else:
-                st.info("JSONL belum tersedia.")
+        chunking_path = save_chunking_jsonl(result_files["jsonl"], image_stem, chunking_json)
+        st.session_state["inference_result"] = {
+            "files": result_files,
+            "rows": rows,
+            "chunking_json": chunking_json,
+            "chunking_path": chunking_path,
+            "save_path": save_path,
+        }
 
-        if result_files["instance"] and result_files["instance"].is_file():
-            st.download_button(
-                "Download Result PNG",
-                data=result_files["instance"].read_bytes(),
-                file_name=result_files["instance"].name,
-                mime="image/png",
-            )
+    inference_result = st.session_state.get("inference_result")
+    if inference_result:
+        show_inference_result(inference_result)
 
     with st.expander("Run command"):
         st.code("uv run streamlit run apps/streamlit_app.py", language="bash")

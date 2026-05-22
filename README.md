@@ -130,3 +130,14 @@ If you find DocSAM helpful for your research or wish to refer to the baseline re
 Code is largely based on [Mask2Former](https://github.com/facebookresearch/Mask2Former).
 
 Pretrained weights of [Mask2Former](https://huggingface.co/facebook/mask2former-swin-large-coco-panoptic) and [all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) are downloaded from huggingface.
+
+
+## Running Inference
+bash scripts/run_streamlit_app.sh
+
+## Running Demo
+DATASET=PubLayNet bash run_inference_demo_hd_clean.sh
+DATASET=Style1 bash run_inference_demo_hd_clean.sh
+DATASET=Style2 bash run_inference_demo_hd_clean.sh
+DATASET=CASIA-HWDB bash run_inference_demo_hd_clean.sh
+DATASET=TotalText bash run_inference_demo_hd_clean.sh
