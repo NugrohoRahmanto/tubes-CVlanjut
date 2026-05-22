@@ -175,6 +175,14 @@ def move_batch_item(item, device):
     return item.to(device)
 
 
+def interpolate_area(image, size):
+    if image.device.type == "mps":
+        # MPS area interpolation uses adaptive pooling, which cannot handle
+        # every non-divisible resize shape yet.
+        return F.interpolate(image.cpu(), size=size, mode="area").to(image.device)
+    return F.interpolate(image, size=size, mode="area")
+
+
 def validate_runtime_args(args):
     args.eval_path = normalize_paths(args.eval_path)
     if not args.eval_path:
@@ -923,7 +931,7 @@ def sliding_window_crop(image, mask, patch_size):
     
     # Preprocess the initial data: resize the entire image and mask to the target patch size using interpolation
     # This ensures that the full image is included as a single patch at the beginning
-    pixel_values.append(F.interpolate(image[None], size=patch_size, mode="area")[0])  # Resize image using area interpolation
+    pixel_values.append(interpolate_area(image[None], size=patch_size)[0])  # Resize image using area interpolation
     pixel_mask.append(F.interpolate(mask[None], size=patch_size, mode="nearest")[0])  # Resize mask using nearest-neighbor interpolation
     patch_bboxes.append([0, 0, W, H])  # Bounding box for the full image in the original coordinate system
     image_bboxes.append([0, 0, patch_size[1], patch_size[0]])  # Bounding box for the full image in the local coordinate system
