@@ -1047,7 +1047,7 @@ def multi_scale_deformable_attention(
     output = (
         (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights)
         .sum(-1)
-        .view(batch_size, num_heads * hidden_dim, num_queries)
+        .reshape(batch_size, num_heads * hidden_dim, num_queries)
     )
     
     return output.transpose(1, 2).contiguous()
@@ -1303,14 +1303,14 @@ class Mask2FormerPixelDecoderEncoderMultiscaleDeformableAttention(nn.Module):
         if attention_mask is not None:
             # we invert the attention_mask
             value = value.masked_fill(attention_mask[..., None], float(0))
-        value = value.view(batch_size, sequence_length, self.n_heads, self.d_model // self.n_heads)
-        sampling_offsets = self.sampling_offsets(hidden_states).view(
+        value = value.reshape(batch_size, sequence_length, self.n_heads, self.d_model // self.n_heads)
+        sampling_offsets = self.sampling_offsets(hidden_states).reshape(
             batch_size, num_queries, self.n_heads, self.n_levels, self.n_points, 2
         )
-        attention_weights = self.attention_weights(hidden_states).view(
+        attention_weights = self.attention_weights(hidden_states).reshape(
             batch_size, num_queries, self.n_heads, self.n_levels * self.n_points
         )
-        attention_weights = nn.functional.softmax(attention_weights, -1).view(
+        attention_weights = nn.functional.softmax(attention_weights, -1).reshape(
             batch_size, num_queries, self.n_heads, self.n_levels, self.n_points
         )
         # batch_size, num_queries, n_heads, n_levels, n_points, 2
@@ -1755,7 +1755,7 @@ class Mask2FormerPixelDecoder(nn.Module):
 
         # Compute final features
         outputs = [
-            x.transpose(1, 2).view(batch_size, -1, spatial_shapes[i][0], spatial_shapes[i][1])
+            x.transpose(1, 2).reshape(batch_size, -1, spatial_shapes[i][0], spatial_shapes[i][1])
             for i, x in enumerate(encoder_output)
         ]
         
@@ -2524,10 +2524,10 @@ class Mask2FormerMaskedAttentionDecoder(nn.Module):
         h_grid = torch.arange(H, device=device).view(1, 1, H, 1) + 0.5  # (1, 1, H, 1)
         w_grid = torch.arange(W, device=device).view(1, 1, 1, W) + 0.5  # (1, 1, 1, W)
 
-        x_min = bboxes[..., 0].view(N, Q, 1, 1)  # (N, Q, 1, 1)
-        y_min = bboxes[..., 1].view(N, Q, 1, 1)
-        x_max = bboxes[..., 2].view(N, Q, 1, 1)
-        y_max = bboxes[..., 3].view(N, Q, 1, 1)
+        x_min = bboxes[..., 0].reshape(N, Q, 1, 1)  # (N, Q, 1, 1)
+        y_min = bboxes[..., 1].reshape(N, Q, 1, 1)
+        x_max = bboxes[..., 2].reshape(N, Q, 1, 1)
+        y_max = bboxes[..., 3].reshape(N, Q, 1, 1)
 
         in_wid = (w_grid >= x_min) & (w_grid <= x_max)  # (N, Q, 1, W)
         in_hei = (h_grid >= y_min) & (h_grid <= y_max) # (N, Q, H, 1)
@@ -2856,18 +2856,18 @@ class Mask2FormerMaskedAttentionDecoder(nn.Module):
             if self.is_multi_scale:
                 roi_feat = [torchvision.ops.roi_align(item, rois, output_size=self.bbox_roi_size, spatial_scale=1/4/pow(2, 3-level)) \
                     for level, item in enumerate(encoder_hidden_states)]
-                roi_feat = [self.bbox_feat_projection[level](item.flatten(1)).view(N, Q, -1) for level, item in enumerate(roi_feat)]
+                roi_feat = [self.bbox_feat_projection[level](item.flatten(1)).reshape(N, Q, -1) for level, item in enumerate(roi_feat)]
                 roi_feat = self.multiscale_feat_fusion(torch.cat(roi_feat, dim=-1))
                 instance_states = 0.5 * instance_states + 0.5 * roi_feat
             else:
                 roi_feat = torchvision.ops.roi_align(pixel_embeddings, rois, output_size=self.bbox_roi_size, spatial_scale=1/4)
-                roi_feat = self.bbox_feat_projection(roi_feat.flatten(1)).view(N, Q, -1)
+                roi_feat = self.bbox_feat_projection(roi_feat.flatten(1)).reshape(N, Q, -1)
                 instance_states = 0.5 * instance_states + 0.5 * roi_feat
 
             # position pooling
             rois = [item[0] for item in instance_bboxes.split(dim=0, split_size=1)]
             instance_posembs = torchvision.ops.roi_align(mask_posembs, rois, output_size=self.bbox_roi_size, spatial_scale=1/4)
-            instance_posembs = self.instance_posi_feat_projection(instance_posembs.flatten(1)).view(instance_states.size())
+            instance_posembs = self.instance_posi_feat_projection(instance_posembs.flatten(1)).reshape(instance_states.size())
             semantic_posembs = self.semantic_posi_feat_projection(mask_posembs.mean((2,3))[:,None,:].expand(semantic_states.size()))
 
             if idx > 0:

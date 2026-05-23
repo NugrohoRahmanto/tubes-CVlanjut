@@ -961,8 +961,8 @@ def sliding_window_crop(image, mask, patch_size):
             image_bboxes.append([0, 0, x2 - x1, y2 - y1])
             
     # Stack all cropped patches, masks, and bounding boxes into tensors
-    pixel_values = torch.stack(pixel_values, dim=0)
-    pixel_mask   = torch.stack(pixel_mask, dim=0)
+    pixel_values = torch.stack(pixel_values, dim=0).contiguous()
+    pixel_mask   = torch.stack(pixel_mask, dim=0).contiguous()
     patch_bboxes = torch.tensor(patch_bboxes).long()
     image_bboxes = torch.tensor(image_bboxes).long()
     
@@ -1093,8 +1093,8 @@ def predict_slide_window(model, batch, patch_size, patch_batch_size=16, layer_id
         image_patch_nums.append(pixel_values.shape[0])  # Store the number of patches for this image
         
     # Concatenate all patches into single tensors for batch processing
-    all_pixel_values = torch.cat(all_pixel_values, dim=0)
-    all_pixel_mask   = torch.cat(all_pixel_mask, dim=0)
+    all_pixel_values = torch.cat(all_pixel_values, dim=0).contiguous()
+    all_pixel_mask   = torch.cat(all_pixel_mask, dim=0).contiguous()
     all_image_bboxes = torch.cat(all_image_bboxes, dim=0)
     
     # Perform predictions using dynamic batch size to handle memory constraints

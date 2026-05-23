@@ -9,4 +9,5 @@ BIND_ADDRESS=${BIND_ADDRESS:-127.0.0.1}
 exec uv run streamlit run apps/streamlit_app.py \
     --server.port "${PORT}" \
     --server.address "${BIND_ADDRESS}" \
-    --server.headless true
+    --server.headless true \
+    --server.fileWatcherType none
